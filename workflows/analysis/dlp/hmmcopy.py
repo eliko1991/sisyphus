@@ -9,81 +9,50 @@ import dbclients.tantalus
 import workflows.analysis.base
 import workflows.analysis.dlp.launchsc
 import datamanagement.templates as templates
-from datamanagement.utils.utils import get_lanes_hash
+from datamanagement.utils.utils import get_datasets_lanes_hash
 from datamanagement.utils.constants import LOGGING_FORMAT
 import workflows.analysis.dlp.results_import as results_import
 
 
-class VariantCallingAnalysis(workflows.analysis.base.Analysis):
-    analysis_type_ = 'variant_calling'
+class HMMCopyAnalysis(workflows.analysis.base.Analysis):
+    analysis_type_ = 'hmmcopy'
 
     def __init__(self, *args, **kwargs):
-        super(VariantCallingAnalysis, self).__init__(*args, **kwargs)
-        self.out_dir = os.path.join(self.jira, "results", self.analysis_type, 'sample_{}'.format(self.args['sample_id']))
-
-    # TODO: Hard coded for now but should be read out of the metadata.yaml files in the future
-    region_split_length = 10000000
+        super(HMMCopyAnalysis, self).__init__(*args, **kwargs)
+        self.out_dir = os.path.join(self.jira, "results", self.analysis_type)
 
     @classmethod
     def search_input_datasets(cls, tantalus_api, jira, version, args):
-        tumour_dataset = tantalus_api.get(
-            'sequencedataset',
-            dataset_type='BAM',
-            analysis__jira_ticket=jira,
+        datasets = tantalus_api.list(
+            'sequence_dataset',
+            analysis__jira_ticket=self.jira,
             library__library_id=args['library_id'],
-            sample__sample_id=args['sample_id'],
-            region_split_length=cls.region_split_length,
-        )
-
-        # TODO: kludge related to the fact that aligner are equivalent between minor versions
-        aligner_name = None
-        if tumour_dataset['aligner'].startswith('BWA_MEM'):
-            aligner_name = 'BWA_MEM'
-        elif tumour_dataset['aligner'].startswith('BWA_ALN'):
-            aligner_name = 'BWA_ALN'
-        else:
-            raise Exception('unknown aligner')
-
-        normal_dataset = tantalus_api.get(
-            'sequencedataset',
             dataset_type='BAM',
-            sample__sample_id=args['normal_sample_id'],
-            library__library_id=args['normal_library_id'],
-            aligner__name__startswith=aligner_name,
-            reference_genome__name=tumour_dataset['reference_genome'],
-            region_split_length=cls.region_split_length,
         )
 
-        return [tumour_dataset['id'], normal_dataset['id']]
+        return [dataset["id"] for dataset in datasets]
 
     @classmethod
     def generate_unique_name(cls, tantalus_api, jira, version, args, input_datasets, input_results):
-        assert len(input_datasets) == 2
-        for dataset_id in input_datasets:
-            dataset = tantalus_api.get('sequencedataset', id=dataset_id)
-            if dataset['sample']['sample_id'] == args['sample_id']:
-                tumour_dataset = dataset
+        lanes_hashed = get_datasets_lanes_hash(tantalus_api, input_datasets)
 
-        name = templates.SC_PSEUDOBULK_ANALYSIS_NAME_TEMPLATE.format(
+        name = templates.SC_QC_ANALYSIS_NAME_TEMPLATE.format(
             analysis_type=cls.analysis_type_,
-            aligner=tumour_dataset['aligner'],
-            ref_genome=tumour_dataset['reference_genome'],
-            library_id=tumour_dataset['library']['library_id'],
-            sample_id=tumour_dataset['sample']['sample_id'],
-            lanes_hashed=get_lanes_hash(tumour_dataset["sequence_lanes"]),
+            aligner=args['aligner'],
+            ref_genome=args['ref_genome'],
+            library_id=args['library_id'],
+            lanes_hashed=lanes_hashed,
         )
 
-        return name
+       return name
 
-    def generate_inputs_yaml(self, storages, inputs_yaml_filename):
-        assert len(self.analysis['input_datasets']) == 2
+    def generate_inputs_yaml(self, inputs_yaml_filename):
+        storage_client = self.tantalus_api.get_storage_client(storages['working_inputs'])
 
         input_info = {}
 
         for dataset_id in self.analysis['input_datasets']:
             dataset = self.tantalus_api.get('sequencedataset', id=dataset_id)
-
-            storage_client = self.tantalus_api.get_storage_client(storages['working_inputs'])
 
             # Read the metadata yaml file
             file_instances = self.tantalus_api.get_dataset_file_instances(
@@ -99,26 +68,17 @@ class VariantCallingAnalysis(workflows.analysis.base.Analysis):
             bam_info = {}
             template = metadata['meta']['bams']['template']
             for instance in metadata['meta']['bams']['instances']:
-                region = instance['region']
+                cell_id = instance['cell_id']
 
                 bams_filename = template.format(**instance)
                 assert bams_filename in metadata['filenames']
-                assert region not in bam_info
+                assert cell_id not in bam_info
 
-                bam_info[region] = {}
-                bam_info[region]['bam'] = os.path.join(
+                bam_info[cell_id] = {}
+                bam_info[cell_id]['bam'] = os.path.join(
                     storage_client.prefix,
                     base_dir,
                     bams_filename)
-
-            if dataset['sample']['sample_id'] == self.args['normal_sample_id']:
-                assert 'normal' not in input_info
-                input_info['normal'] = bam_info
-            elif dataset['sample']['sample_id'] == self.args['sample_id']:
-                assert 'tumour' not in input_info
-                input_info['tumour'] = bam_info
-            else:
-                raise Exception(f'unrecognized dataset {dataset_id}')
 
         with open(inputs_yaml_filename, 'w') as inputs_yaml:
             yaml.safe_dump(input_info, inputs_yaml, default_flow_style=False)
@@ -139,7 +99,7 @@ class VariantCallingAnalysis(workflows.analysis.base.Analysis):
         out_path = os.path.join(storage_client.prefix, self.out_dir)
 
         return workflows.analysis.dlp.launchsc.run_pipeline(
-            analysis_type='variant_calling',
+            analysis_type='hmmcopy',
             version=self.version,
             run_options=run_options,
             scpipeline_dir=scpipeline_dir,
@@ -174,13 +134,13 @@ class VariantCallingAnalysis(workflows.analysis.base.Analysis):
         return [results['id']]
 
 
-workflows.analysis.base.Analysis.register_analysis(VariantCallingAnalysis)
+workflows.analysis.base.Analysis.register_analysis(HMMCopyAnalysis)
 
 
 def create_analysis(jira_id, version, args):
     tantalus_api = dbclients.tantalus.TantalusApi()
 
-    analysis = VariantCallingAnalysis.create_from_args(tantalus_api, jira_id, version, args)
+    analysis = HMMCopyAnalysis.create_from_args(tantalus_api, jira_id, version, args)
 
     logging.info(f'created analysis {analysis.get_id()}')
 
@@ -199,16 +159,14 @@ def analysis():
 @analysis.command()
 @click.argument('jira_id')
 @click.argument('version')
-@click.argument('sample_id')
 @click.argument('library_id')
-@click.argument('normal_sample_id')
-@click.argument('normal_library_id')
-def create_single_analysis(jira_id, version, sample_id, library_id, normal_sample_id, normal_library_id):
+@click.argument('aligner')
+@click.argument('ref_genome')
+def create_single_analysis(jira_id, version, library_id, aligner, ref_genome):
     args = {}
-    args['sample_id'] = sample_id
     args['library_id'] = library_id
-    args['normal_sample_id'] = normal_sample_id
-    args['normal_library_id'] = normal_library_id
+    args['aligner'] = aligner
+    args['ref_genome'] = ref_genome
 
     create_analysis(jira_id, version, args)
 
@@ -223,10 +181,9 @@ def create_multiple_analyses(version, info_table):
         jira_id = row['jira_id']
 
         args = {}
-        args['sample_id'] = row['sample_id']
         args['library_id'] = row['library_id']
-        args['normal_sample_id'] = row['normal_sample_id']
-        args['normal_library_id'] = row['normal_library_id']
+        args['aligner'] = row['aligner']
+        args['ref_genome'] = row['ref_genome']
 
         try:
             create_analysis(jira_id, version, args)
